@@ -1,4 +1,4 @@
-# Maven
+# Maven / Java
 target/
 *.class
 
@@ -9,12 +9,25 @@ target/
 
 # Logs
 logs/
+runs/
 
-# Dataset (too large for git — download separately from IAM website)
+# Dataset — too large for git
 data/raw/
+data/synthetic/
 
-# Trained model checkpoints
+# HuggingFace cache
+.cache/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Java model (replaced by Python)
 models/
+
+# Debug outputs
+debug_model_input.png
 
 # OS
 .DS_Store

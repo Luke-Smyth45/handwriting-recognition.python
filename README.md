@@ -1,353 +1,429 @@
-# Handwriting Recognition AI
+# Handwriting Recognition — CRNN on IAM
 
-A Java application that recognises handwritten English words. You draw (or load) a word image, click **Recognise**, and the model predicts the text.
-
-Built with [DeepLearning4J](https://deeplearning4j.konduit.ai/) on a CNN + LSTM architecture, trained on the [IAM Handwriting Word Database](https://www.kaggle.com/datasets/nibinv23/iam-handwriting-word-database).
-
----
-
-## Requirements
-
-| Requirement | Version |
-|---|---|
-| Java | 17 or later |
-| Maven | 3.8 or later |
-| CUDA Toolkit | 11.6 (GPU training only) |
-| GPU | NVIDIA with CUDA 11.6 support (e.g. RTX 3070 Ti) |
-
-> **CPU-only machines:** Replace `nd4j-cuda-11.6-platform` with `nd4j-native-platform` in `pom.xml` before building. Training will still work but will be significantly slower.
+A deep learning pipeline that reads images of handwritten words and transcribes them to text.
+Built with PyTorch using a CRNN (Convolutional Recurrent Neural Network) trained on the
+[IAM Handwriting Word Database](https://www.kaggle.com/datasets/nibinv23/iam-handwriting-word-database).
 
 ---
 
-## Quick Start
+## Table of Contents
 
-### 1. Clone and build
-
-```bash
-git clone https://github.com/Luke-Smyth45/Handwriting-Recognition-AI.git
-cd Handwriting-Recognition-AI
-mvn package -q
-```
-
-This produces `target/handwriting-recognition-1.0-SNAPSHOT.jar`.
-
-### 2. Get the dataset (for training)
-
-Download the IAM Handwriting Word Database from Kaggle:
-https://www.kaggle.com/datasets/nibinv23/iam-handwriting-word-database
-
-Extract it so the folder structure looks like:
-
-```
-data/raw/archive/iam_words/
-    words.txt
-    words/
-        a01/
-            a01-000u/
-                a01-000u-00-00.png
-                ...
-```
-
-### 3. Validate the dataset
-
-```bash
-java -jar target/handwriting-recognition-1.0-SNAPSHOT.jar --validate
-```
-
-This checks that the dataset is in the correct location and all image files are readable. Fix any errors it reports before training.
-
-### 4. Train the model
-
-```bash
-java -jar target/handwriting-recognition-1.0-SNAPSHOT.jar --train
-```
-
-- Validates the dataset automatically before starting
-- Pre-loads all images into RAM for faster GPU throughput
-- Saves the best model (by validation loss) to `models/htr_model.zip`
-- If `models/htr_model.zip` already exists, training **resumes from that checkpoint**
-- Logs training progress to console and to `logs/`
-
-Training runs for 10 epochs with batch size 128. On an RTX 3070 Ti this takes roughly an hour.
-
-### 5. Launch the UI
-
-```bash
-java -jar target/handwriting-recognition-1.0-SNAPSHOT.jar --ui
-```
-
-The UI loads `models/htr_model.zip` automatically if it exists.
+1. [How It Works](#how-it-works)
+2. [Project Structure](#project-structure)
+3. [Setup](#setup)
+4. [Dataset](#dataset)
+5. [Training](#training)
+6. [Evaluation](#evaluation)
+7. [Inference](#inference)
+8. [Interactive Drawing GUI](#interactive-drawing-gui)
+9. [Configuration Reference](#configuration-reference)
+10. [Results](#results)
+11. [What Can Be Improved](#what-can-be-improved)
 
 ---
 
-## Modes
+## How It Works
 
-| Flag | Description |
-|---|---|
-| `--ui` | Launch the graphical interface (default) |
-| `--train` | Validate dataset then train the model |
-| `--validate` | Check dataset structure only and exit |
-| `--test` | Run the pipeline smoke tests and exit |
+### Architecture
 
----
+The model is a **CRNN** — a CNN feature extractor feeding into a recurrent sequence model,
+trained end-to-end with CTC loss.
 
-## Using the UI
+```
+Input image (1, 32, 128)
+        │
+        ▼
+┌───────────────┐
+│  CNN Backbone │  4 blocks of Conv-BN-ReLU + MaxPool
+│               │  Collapses height to 1, preserves width
+│  Output:      │  (512, 1, 32)
+└───────┬───────┘
+        │  reshape to sequence
+        ▼
+┌───────────────┐
+│  BiLSTM x2   │  2 stacked bidirectional LSTM layers
+│  hidden=256   │  captures left and right context
+│  Output:      │  (32, 512)
+└───────┬───────┘
+        │
+        ▼
+┌───────────────┐
+│  Linear Head  │  projects to vocabulary size (96 classes)
+└───────┬───────┘
+        │
+        ▼
+  CTC Decode  →  "hello"
+```
 
-![UI Layout](docs/ui-screenshot.png)
+**CNN Backbone** — Four convolutional blocks progressively reduce the 32px-tall input
+image down to a single-row feature map of width W/4. This turns the 2D image into a
+1D sequence of 32 column vectors, each summarising a vertical slice of the word.
 
-The window has three sections:
+**BiLSTM** — Two stacked bidirectional LSTM layers read the column sequence left-to-right
+and right-to-left simultaneously, giving each time step full context of the whole word.
 
-**Toolbar (top)**
-- **Load Model...** — load any `.zip` model file (opens a file picker pointing at the `models/` folder)
-- **Load Image...** — load a PNG/JPEG/BMP image of a handwritten word instead of drawing
-- **Clear** — wipe the canvas and any loaded image
+**CTC Loss** — Connectionist Temporal Classification allows the model to be trained without
+knowing which output character aligns to which pixel. It marginalises over all valid
+alignments, making it ideal for handwriting where character widths vary.
 
-**Drawing canvas (middle)**
-- Draw a single handwritten word using the mouse
-- The canvas is 480×120 pixels — a 4:1 aspect ratio that matches the training images exactly
-- Keep your word centred and roughly filling the canvas height for best results
+### Decoding
 
-**Bottom section**
-- **Recognise** button — runs inference on whatever is in the canvas (or the loaded image)
-- Result display — shows the predicted word
+Two decoding strategies are available after training:
 
-### Tips for good predictions
-- Write one word at a time
-- Use the full height of the canvas
-- Write clearly — the model was trained on handwritten but legible English words
-- The model recognises: letters (upper and lower case), digits, and common punctuation
+- **Greedy** — picks the highest-probability character at each time step, then collapses
+  repeated tokens and removes blanks. Fast but suboptimal.
+- **Beam Search** — maintains the top-N candidate sequences at each step and picks the
+  best final sequence. More accurate, especially for ambiguous strokes.
+
+### Data Pipeline
+
+Images are loaded as grayscale, resized to a fixed height of 32px (width scaled
+proportionally then padded/cropped to 128px), and normalised to `[-1, 1]`.
+
+During training, light augmentations are applied:
+- Random rotation ±3°
+- Random width scaling ±10%
+- Random brightness jitter ±30
+- Gaussian noise (σ=5)
+
+Splits are generated deterministically from the data by grouping samples by **writer ID**,
+ensuring no writer appears in more than one split (writer-independent evaluation):
+- **Train** — 29,851 samples (~80% of writers)
+- **Val** — 888 samples (~10% of writers)
+- **Test** — 7,566 samples (~10% of writers)
 
 ---
 
 ## Project Structure
 
 ```
-src/main/java/com/htr/
-    Main.java                       Entry point, CLI argument routing
-    ModelTest.java                  Pipeline smoke tests (--test)
-    data/
-        IAMDataLoader.java          Parses words.txt and locates image files
-        IAMSample.java              One training sample (image path + transcription)
-        DatasetSplit.java           Train / val / test split container
-        DatasetValidator.java       Validates dataset structure before training
-        ImagePreprocessor.java      Resize → pad → normalise → invert image pipeline
-        CharsetEncoder.java         Character ↔ integer index mapping for CTC
-    model/
-        ModelConfig.java            All hyperparameters and paths in one place
-        ModelGraph.java             Builds the CNN + LSTM ComputationGraph
-        HTRModel.java               Loads a saved model and runs inference
-        CTCDecoder.java             Greedy and beam-search CTC decoding
-    training/
-        ModelTrainer.java           Training loop, image cache, checkpoint saving
-    ui/
-        HandwritingRecognitionUI.java   Main application window
-        DrawingPanel.java               Free-hand mouse drawing canvas
-        ResultPanel.java                Prediction result display
+handwriting-recognition/
+├── config.py          # All hyperparameters, paths, and vocabulary
+├── model.py           # CRNN architecture (CNN + BiLSTM + CTC head)
+├── dataset.py         # IAM dataset loader, augmentations, split generation
+├── train.py           # Training loop with AMP, checkpointing, TensorBoard
+├── evaluate.py        # CER/WER metrics, beam search decoder, test-set eval
+├── inference.py       # Single-image prediction from file
+├── draw.py            # Interactive GUI — draw a word and predict it
+├── requirements.txt   # Python dependencies
+└── data/
+    └── raw/
+        └── archive/
+            └── iam_words/
+                ├── words.txt       # Ground-truth labels
+                └── words/          # Word image tree (a01/a01-000u/...)
+```
+
+Directories created automatically at runtime:
+```
+checkpoints/    # Saved model weights (.pt files)
+runs/           # TensorBoard logs
 ```
 
 ---
 
-## Architecture
+## Setup
 
-```
-Input image [B, 1, 32, 128]  (batch × channels × height × width)
-         │
-         ▼
-┌──────────────────────────────────────────────────────────┐
-│  5 × CNN Blocks (Conv 3×3 + ReLU + MaxPool)              │
-│                                                          │
-│  Block 1: 32  filters, pool (2,2) → [B, 32,  16,  64]   │
-│  Block 2: 64  filters, pool (2,2) → [B, 64,   8,  32]   │
-│  Block 3: 128 filters, pool (2,2) → [B, 128,  4,  16]   │
-│  Block 4: 128 filters, no pool    → [B, 128,  4,  16]   │
-│  Block 5: 256 filters, pool (2,1) → [B, 256,  2,  16]   │
-│                        ↑ height-only pool, width kept    │
-└──────────────────────────────────────────────────────────┘
-         │
-         ▼
-  ReshapeVertex: [B, 256, 2, 16] → [B, 512, 16]
-  (channels × height collapsed into features;
-   width becomes 16 time steps)
-         │
-         ▼
-┌──────────────────────────────────────────┐
-│  LSTM 1: 512 → 256 units                 │
-│  LSTM 2: 256 → 80 units (= NUM_CLASSES)  │
-└──────────────────────────────────────────┘
-         │
-         ▼
-  RnnOutputLayer (Identity activation + CTC loss)
-  Output: [B, 80, 16]  (80 classes × 16 time steps)
-         │
-         ▼
-  CTC Decoder → predicted word string
-```
+**Requirements:** Python 3.10+, an NVIDIA GPU (recommended)
 
-**Why 80 classes?** The model recognises 79 printable ASCII characters plus a CTC blank token used during decoding to separate repeated characters.
-
-**Supported characters:**
-```
- !"#&'()*+,-./0123456789:;?
- ABCDEFGHIJKLMNOPQRSTUVWXYZ
- abcdefghijklmnopqrstuvwxyz
-```
-
----
-
-## Configuration
-
-All hyperparameters are in [src/main/java/com/htr/model/ModelConfig.java](src/main/java/com/htr/model/ModelConfig.java):
-
-| Parameter | Value | Description |
-|---|---|---|
-| `IMG_HEIGHT` | 32 | Input image height (pixels) |
-| `IMG_WIDTH` | 128 | Input image width (pixels) |
-| `CNN_FILTERS` | [32, 64, 128, 128, 256] | Filters per CNN block |
-| `RNN_UNITS` | 256 | LSTM hidden units |
-| `NUM_CLASSES` | 80 | Characters + CTC blank |
-| `BATCH_SIZE` | 128 | Training batch size |
-| `EPOCHS` | 10 | Training epochs |
-| `LEARNING_RATE` | 1e-4 | Adam learning rate |
-| `BEAM_WIDTH` | 10 | CTC beam search width |
-| `DATASET_ROOT` | `data/raw/archive/iam_words` | Dataset location |
-| `MODEL_SAVE_DIR` | `models/htr_model.zip` | Model save path |
-
----
-
-## Training Details
-
-### Loss function
-True CTC (Connectionist Temporal Classification) loss, implemented in `CTCLossFunction.java`. The network outputs raw logits at each of the 16 time steps; the CTC algorithm finds the best alignment between the output sequence and the target characters automatically — no manual label stretching is needed.
-
-The raw loss reported during training is the negative log-probability summed over all 16 time steps. At the start of training, random-baseline loss is approximately 16 × ln(80) ≈ 70. Words up to 15 characters long are handled without truncation.
-
-### Image pre-caching
-Before the first epoch, all training and validation images are decoded and stored in RAM as flat `float[]` arrays. This eliminates per-batch disk I/O and is critical for keeping the GPU fed. On the IAM word dataset (~115,000 images at 32×128 = 4,096 floats each) this uses roughly 1.8 GB of RAM.
-
-### Checkpoint saving
-The model is saved to `models/htr_model.zip` whenever validation loss improves. Running `--train` again automatically resumes from this file, so training can be interrupted and continued at any time.
-
-### Gradient clipping
-LSTM gradient explosion is prevented with `ClipElementWiseAbsoluteValue` at threshold 1.0. If you see loss diverging to very large values (> 50), delete `models/htr_model.zip` and restart training.
-
----
-
-## Running the Pipeline Tests
-
-Before training on a new machine, run the smoke tests to confirm the CNN→LSTM pipeline is working correctly:
+### 1. Install dependencies
 
 ```bash
-java -jar target/handwriting-recognition-1.0-SNAPSHOT.jar --test
+pip install -r requirements.txt
 ```
 
-Three tests run:
-1. **Model build** — confirms the ComputationGraph compiles without error
-2. **Forward pass shape** — confirms output is `[2, 80, 16]` not `[2, 80, 1]` (shape `[..., 1]` would indicate a broken CNN→RNN reshape)
-3. **Real training batch** — confirms one batch from the actual dataset trains without error
+### 2. Install PyTorch with CUDA support
 
-All three must pass before running `--train`.
+The default `pip install torch` installs the CPU-only build. For GPU support:
 
----
+```bash
+# CUDA 12.1 (works with driver versions reporting CUDA 12.x or 13.x)
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 
-## Dependencies
-
-| Library | Version | Purpose |
-|---|---|---|
-| DeepLearning4J | 1.0.0-M2.1 | Neural network framework |
-| ND4J CUDA 11.6 | 1.0.0-M2.1 | GPU-accelerated tensor operations |
-| Apache Commons Math | 3.6.1 | Numerical utilities |
-| Apache Commons IO | 2.15.1 | File utilities |
-| Logback | 1.2.12 | Logging |
-| JUnit 5 | 5.10.2 | Testing |
-
----
-
-## Known Limitations and Improvements
-
-### 1. Unidirectional LSTM — switch to Bidirectional
-
-**Current behaviour:** Both LSTM layers process the sequence left-to-right only.
-
-**Why it matters:** Characters in a word depend on both the letters before and after them (e.g. distinguishing `rn` from `m` is easier with context from both directions). Bidirectional LSTMs are standard in HTR and typically improve word accuracy by several percentage points.
-
-**How to fix:** DL4J has a `Bidirectional` wrapper, but it has a known bug in version 1.0.0-M2.1 when combined with `ReshapeVertex` in a `ComputationGraph` (it was the root cause of the "sequence length = 1" bug this project worked around). The fix either requires upgrading DL4J or switching the training to Python.
-
----
-
-### 2. Inference still uses slow putScalar loops
-
-**Current behaviour:** `HTRModel.java` builds the input tensor using nested `putScalar` calls (4,096 calls per inference). The trainer was updated to use `NDArrayIndex` slice assignment, but the inference path was not.
-
-**How to fix:** Apply the same pattern used in `ModelTrainer.runBatch()`:
-
-```java
-// In HTRModel.predict(), replace the putScalar loops with:
-INDArray input = Nd4j.create(ImagePreprocessor.flatten(imageData),
-                             new int[]{1, 1, h, w});
+# CUDA 11.8
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
 ```
 
-This is a single native memory copy instead of 4,096 individual Java calls. It won't matter much for interactive use but is important if you ever run batch inference.
+Verify GPU is detected:
+```bash
+python -c "import torch; print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0))"
+```
 
 ---
 
-### 3. Beam search decoder is unused at inference time
+## Dataset
 
-**Current behaviour:** `CTCDecoder` implements both greedy and beam-search decoding, but `HTRModel.predict()` calls `greedyDecode()`. Beam search (`beamSearchDecode()`) is never used.
+Download the **IAM Handwriting Word Database** from Kaggle:
+[nibinv23/iam-handwriting-word-database](https://www.kaggle.com/datasets/nibinv23/iam-handwriting-word-database)
 
-**Why it matters:** Beam search keeps multiple candidate sequences alive and picks the globally best one. For 16 time steps the improvement is measurable, especially for ambiguous characters.
+Extract `archive.zip` into `data/raw/`:
+```bash
+# Windows PowerShell
+Expand-Archive -Path archive.zip -DestinationPath data\raw\
 
-**How to fix:** In `HTRModel.java`, change `decoder.greedyDecode(logitMatrix)` to `decoder.beamSearchDecode(logitMatrix)`. The beam width is already configurable via `ModelConfig.BEAM_WIDTH` (currently 10).
+# Linux / macOS
+unzip archive.zip -d data/raw/
+```
 
----
+The expected layout after extraction:
+```
+data/raw/archive/iam_words/
+├── words.txt
+└── words/
+    ├── a01/
+    ├── a02/
+    └── ...
+```
 
-### 4. No data augmentation
-
-**Current behaviour:** Training images are used as-is after resize, pad, and normalise. Every epoch sees identical data.
-
-**Why it matters:** The IAM dataset contains ~115,000 word images but they come from a limited number of writers. Augmentation simulates more variety and reduces overfitting.
-
-**Augmentations to add in `ImagePreprocessor.java`:**
-- Random slight rotation (±5°)
-- Random brightness/contrast jitter
-- Random horizontal stretch (simulate different writing speeds)
-- Gaussian noise
-
----
-
-### 5. No test set evaluation
-
-**Current behaviour:** Training reports `train_loss` and `val_loss` each epoch but never evaluates on the held-out test split. The test set (~2,915 samples) is loaded but unused.
-
-**How to fix:** After training completes, run inference on `split.getTestSamples()` and compute Character Error Rate (CER) and Word Error Rate (WER) — the standard metrics for HTR. CER counts the Levenshtein edit distance between predicted and ground-truth characters; WER counts fully incorrect words. Add this as a `evaluateTest()` method in `ModelTrainer.java`.
+No further setup is needed — train/val/test splits are generated automatically.
 
 ---
 
-### 6. Single-word only
+## Training
 
-**Current behaviour:** The model accepts one word at a time. The drawing canvas and image loader pass a single fixed-size image to the model.
+```bash
+python train.py
+```
 
-**Why it matters:** Real-world use almost always involves full lines or paragraphs.
+**Optional flags:**
 
-**How to fix:** This is a large architectural change. The standard approach is to add a text-line segmentation stage before the word recogniser — either a classical connected-components approach or a separate segmentation network that splits a line image into individual word crops before passing each to this model.
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--epochs N` | 50 | Number of training epochs |
+| `--batch-size N` | 64 | Batch size (reduce if GPU runs out of memory) |
+| `--resume PATH` | None | Resume training from a saved checkpoint |
+
+**Examples:**
+```bash
+python train.py --epochs 100 --batch-size 32
+python train.py --resume checkpoints/epoch_050.pt
+```
+
+**What gets saved:**
+- `checkpoints/best.pt` — saved whenever validation CER improves
+- `checkpoints/epoch_NNN.pt` — saved every 5 epochs
+
+**Monitor training in a separate terminal:**
+```bash
+tensorboard --logdir runs
+```
+Then open `http://localhost:6006`. Logged metrics: `train/loss`, `val/loss`, `val/CER`, `train/lr`.
+
+**Training features:**
+- Automatic Mixed Precision (fp16) for ~2x speed on CUDA
+- OneCycleLR learning rate schedule
+- Gradient clipping (max norm 5.0)
+- AdamW optimiser with weight decay
 
 ---
 
-## Troubleshooting
+## Evaluation
 
-**Training starts but GPU usage stays at 5%**
-The image pre-cache phase runs before the first epoch and logs `Image cache ready: N loaded`. If this message does not appear, the cache is not working and data loading is bottlenecking the GPU.
+Run the full test set (7,566 samples) and print CER, WER, and sample predictions:
 
-**`No samples found in: data/raw/archive/iam_words`**
-The dataset is not in the expected location. Run `--validate` for a detailed diagnosis. The `data/` folder must be in the same directory as the JAR.
+```bash
+python evaluate.py
+```
 
-**`SLF4J: No SLF4J providers were found`**
-The logback dependency is missing or conflicting. Ensure `pom.xml` has `logback-classic` version `1.2.12` (not 1.4.x — that requires SLF4J 2.x which conflicts with DL4J's SLF4J 1.x).
+**Optional flags:**
 
-**`Could not load existing model ... starting fresh`**
-The saved model `.zip` is incompatible with the current architecture (e.g. after changing `ModelGraph.java`). Delete `models/htr_model.zip` and retrain from scratch.
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--checkpoint PATH` | `checkpoints/best.pt` | Checkpoint to load |
+| `--split` | `test` | Dataset split: `train`, `val`, or `test` |
+| `--beam` | off | Use beam search instead of greedy decoding |
+| `--beam-width N` | 5 | Number of beams for beam search |
+| `--batch-size N` | 64 | Batch size |
 
-**Loss diverges / goes to NaN**
-LSTM gradient explosion. Delete `models/htr_model.zip` and retrain. The gradient clipping should prevent this on a fresh model.
+**Examples:**
+```bash
+python evaluate.py --beam --beam-width 10
+python evaluate.py --split val --checkpoint checkpoints/epoch_030.pt
+```
 
-**Output shape `[B, 80, 1]` instead of `[B, 80, 16]`**
-A DL4J 1.0.0-M2.1 bug in `CnnToRnnPreProcessor` collapses the time dimension to 1. This project uses `ReshapeVertex` as a workaround. Run `--test` to confirm the fix is active. Do **not** add `.setInputTypes()` to `ModelGraph.java` — it silently overrides the ReshapeVertex.
+**Output:**
+```
+[greedy]  CER=0.1640  WER=0.3200  (7,566 samples)
+
+Sample predictions:
+  GT  : 'hello'
+  PRED: 'hello'
+
+  GT  : 'world'
+  PRED: 'worId'
+```
+
+**Metrics:**
+- **CER** (Character Error Rate) — edit distance between predicted and ground-truth string,
+  divided by ground-truth length. 0.16 = ~16% of characters are wrong.
+- **WER** (Word Error Rate) — same but at the word level. Always higher than CER.
+
+---
+
+## Inference
+
+Predict the text in a single word image:
+
+```bash
+python inference.py --image path/to/word.png
+```
+
+**Optional flags:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--checkpoint PATH` | `checkpoints/best.pt` | Checkpoint to load |
+| `--beam` | off | Use beam search |
+| `--beam-width N` | 5 | Beam width |
+| `--show` | off | Display image + prediction in a matplotlib window |
+
+**Examples:**
+```bash
+python inference.py --image word.png --beam --beam-width 10
+python inference.py --image word.png --show
+```
+
+**Output:**
+```
+[greedy]  "recognition"
+```
+
+---
+
+## Interactive Drawing GUI
+
+Draw a word with your mouse and have the model transcribe it in real time:
+
+```bash
+python draw.py
+```
+
+A window appears with a white 640×160 canvas. Draw a single word, then click **Predict**.
+Click **Clear** to reset and try again.
+
+```
+┌──────────────────────────────────────────┐
+│  Draw a single handwritten word below    │
+├──────────────────────────────────────────┤
+│                                          │
+│   [white canvas — draw here]             │
+│                                          │
+├──────────────────────────────────────────┤
+│   [ Predict ]   [ Clear ]                │
+│                                          │
+│   [greedy]  "hello"                      │
+└──────────────────────────────────────────┘
+```
+
+**Optional flags:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--checkpoint PATH` | `checkpoints/best.pt` | Checkpoint to load |
+| `--beam` | off | Use beam search |
+| `--beam-width N` | 5 | Beam width |
+
+Note: the model was trained on scanned handwriting samples, so mouse-drawn input will look
+different to the training data. Results are best when drawing slowly and clearly.
+
+---
+
+## Configuration Reference
+
+All settings live in `config.py`. Key values:
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `DEVICE` | `"cuda"` | `"cpu"` if no GPU available |
+| `IMG_HEIGHT` | `32` | Fixed image height (px) |
+| `IMG_WIDTH` | `128` | Fixed image width after padding (px) |
+| `EPOCHS` | `50` | Training epochs |
+| `BATCH_SIZE` | `64` | Training batch size |
+| `LR` | `3e-4` | Peak learning rate |
+| `RNN_HIDDEN` | `256` | BiLSTM hidden units per direction |
+| `RNN_LAYERS` | `2` | Number of stacked BiLSTM layers |
+| `RNN_DROPOUT` | `0.1` | Dropout between LSTM layers |
+| `BEAM_WIDTH` | `5` | Default beam search width |
+| `USE_AMP` | `True` | Mixed precision (fp16) — CUDA only |
+| `GRAD_CLIP` | `5.0` | Gradient clipping max norm |
+
+---
+
+## Results
+
+Trained for 50 epochs on an NVIDIA RTX 3070 Ti (~32s/epoch):
+
+| Metric | Value |
+|--------|-------|
+| Best val CER | ~0.164 |
+| Training time | ~27 min total |
+
+Overfitting was observed from around epoch 35 — training loss continued to fall while
+validation CER plateaued. The best checkpoint is saved automatically.
+
+---
+
+## What Can Be Improved
+
+### Accuracy
+
+**Increase regularisation**
+The model overfits after ~35 epochs. Raising `RNN_DROPOUT` from `0.1` to `0.3` in
+`config.py` and adding dropout after CNN blocks would reduce this.
+
+**Stronger augmentations**
+The current augmentations are minimal. Adding elastic distortion, random perspective
+warps, and random erosion/dilation would better simulate real handwriting variation.
+The `albumentations` library (already in `requirements.txt`) supports all of these.
+
+**Larger input width**
+`IMG_WIDTH = 128` crops longer words. Increasing to `256` or `512` would preserve more
+information at the cost of more memory and slower training.
+
+**Attention mechanism**
+Replacing the BiLSTM with a Transformer encoder would give the model global attention
+over the full sequence rather than only local context, typically improving accuracy on
+longer words.
+
+**Language model decoding**
+The beam search has no language model — it scores sequences purely on acoustic probability.
+Integrating a character-level n-gram LM via `pyctcdecode` or `ctcdecode` would significantly
+reduce WER by favouring real words over nonsense sequences.
+
+### Data
+
+**Pre-training on synthetic data**
+IAM contains ~38k word samples, which is small by modern standards. Generating millions of
+synthetic handwriting images using fonts and augmentations (e.g. with the `TextRecognitionDataGenerator`
+library) and pre-training on those before fine-tuning on IAM is the single highest-leverage
+improvement available.
+
+**Additional real datasets**
+Other handwriting datasets that can supplement IAM: RIMES (French), CVL, ICDAR competitions.
+
+### Training
+
+**Early stopping**
+Currently training runs for a fixed number of epochs. Adding early stopping (halt when
+val CER hasn't improved for N epochs) would prevent wasted compute and save the best model
+more reliably.
+
+**Learning rate tuning**
+The OneCycleLR scheduler works well but the peak LR (`3e-4`) and warmup fraction (`10%`)
+were not tuned. A learning rate finder pass before training would identify the optimal value.
+
+### Deployment
+
+**ONNX export**
+The trained model can be exported to ONNX for deployment outside of Python/PyTorch:
+```python
+torch.onnx.export(model, dummy_input, "model.onnx")
+```
+
+**Batch inference API**
+`inference.py` processes one image at a time. Wrapping it in a FastAPI server would allow
+batch requests and integration into other applications.
+
+**Line-level recognition**
+The current model operates on pre-segmented word images. Adding a text detection stage
+(e.g. CRAFT or DBNet) would allow recognising full lines or paragraphs from a photograph.
