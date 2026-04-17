@@ -24,6 +24,7 @@ import config
 from dataset import preprocess_image
 from model import CRNN, _greedy_decode
 from evaluate import beam_decode
+from page_recogniser import recognise_page, load_model, visualise_segmentation
 
 
 # ---------------------------------------------------------------------------
@@ -166,8 +167,13 @@ class DrawApp:
         ).pack(side=tk.LEFT, padx=8)
 
         tk.Button(
-            btn_frame, text="Load Image", width=12, bg="#6c757d", fg="white",
+            btn_frame, text="Load Word", width=12, bg="#6c757d", fg="white",
             font=("Helvetica", 11), command=self._load_image,
+        ).pack(side=tk.LEFT, padx=8)
+
+        tk.Button(
+            btn_frame, text="Load Page", width=12, bg="#28a745", fg="white",
+            font=("Helvetica", 11, "bold"), command=self._load_page,
         ).pack(side=tk.LEFT, padx=8)
 
         tk.Button(
@@ -269,6 +275,76 @@ class DrawApp:
         self._real_img_array = img_cv   # keep original resolution for inference
         self.result_var.set('Image loaded — click "Predict"')
 
+    def _load_page(self):
+        path = filedialog.askopenfilename(
+            title="Select a full page handwriting image",
+            filetypes=[("Image files", "*.png *.jpg *.jpeg *.bmp *.tiff"), ("All files", "*.*")]
+        )
+        if not path:
+            return
+
+        img_cv = cv2.imread(path)
+        if img_cv is None:
+            self.result_var.set("Could not load image.")
+            return
+
+        # Show the page image on canvas (scaled to fit)
+        img_rgb = cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB)
+        pil_page = Image.fromarray(img_rgb)
+        pil_page_resized = pil_page.resize((self.CANVAS_W, self.CANVAS_H), Image.LANCZOS)
+
+        from PIL import ImageTk
+        self._tk_img = ImageTk.PhotoImage(pil_page_resized)
+        self.canvas.delete("all")
+        self.canvas.create_image(0, 0, anchor=tk.NW, image=self._tk_img)
+
+        self.result_var.set("Recognising page... please wait")
+        self.root.update_idletasks()
+
+        # Run full page recognition
+        text = recognise_page(
+            img_cv, self.model, self.device,
+            use_beam=self.use_beam,
+            beam_width=self.beam_width,
+            verbose=False,
+        )
+
+        if not text.strip():
+            self.result_var.set("No text detected. Try a clearer image.")
+            return
+
+        # Show result in a popup window
+        self._show_page_result(text)
+        self.result_var.set("Page recognised — see result window")
+
+    def _show_page_result(self, text: str):
+        """Show the full page transcription in a scrollable popup window."""
+        win = tk.Toplevel(self.root)
+        win.title("Page Transcription")
+        win.geometry("600x400")
+        win.resizable(True, True)
+
+        tk.Label(win, text="Transcribed Text:", font=("Helvetica", 12, "bold"),
+                 pady=8).pack()
+
+        frame = tk.Frame(win)
+        frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 12))
+
+        scrollbar = tk.Scrollbar(frame)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        text_box = tk.Text(frame, font=("Courier", 12), wrap=tk.WORD,
+                           yscrollcommand=scrollbar.set)
+        text_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.config(command=text_box.yview)
+
+        text_box.insert(tk.END, text)
+        text_box.config(state=tk.DISABLED)
+
+        tk.Button(win, text="Copy to Clipboard", font=("Helvetica", 11),
+                  command=lambda: [win.clipboard_clear(),
+                                   win.clipboard_append(text)]).pack(pady=(0, 8))
+
     def _clear(self):
         self.canvas.delete("all")
         self._pil_img  = Image.new("RGB", (self.CANVAS_W, self.CANVAS_H), "white")
@@ -290,12 +366,7 @@ def main():
     args = parser.parse_args()
 
     device = torch.device(config.DEVICE if torch.cuda.is_available() else "cpu")
-
-    model = CRNN().to(device)
-    ckpt  = torch.load(args.checkpoint, map_location=device)
-    model.load_state_dict(ckpt["model"])
-    model.eval()
-    print(f"Loaded checkpoint: {args.checkpoint}  (epoch {ckpt['epoch']})")
+    model  = load_model(args.checkpoint, device)
 
     root = tk.Tk()
     DrawApp(root, model, device, use_beam=args.beam, beam_width=args.beam_width)
