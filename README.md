@@ -1,429 +1,442 @@
-# Handwriting Recognition — CRNN on IAM
+# Handwriting Recognition AI
 
-A deep learning pipeline that reads images of handwritten words and transcribes them to text.
-Built with PyTorch using a CRNN (Convolutional Recurrent Neural Network) trained on the
-[IAM Handwriting Word Database](https://www.kaggle.com/datasets/nibinv23/iam-handwriting-word-database).
+A deep learning system for recognising handwritten text — both individual words and full pages of handwriting.
+Built with PyTorch using a CRNN (Convolutional Recurrent Neural Network) trained on the IAM Handwriting Database.
+
+> **Branch `Rayans-Model`** — Python/PyTorch implementation by Rayan Rakib  
+> Best model: **7.51% CER / 22.3% WER** on the IAM test set
 
 ---
 
 ## Table of Contents
 
-1. [How It Works](#how-it-works)
-2. [Project Structure](#project-structure)
-3. [Setup](#setup)
-4. [Dataset](#dataset)
-5. [Training](#training)
-6. [Evaluation](#evaluation)
-7. [Inference](#inference)
-8. [Interactive Drawing GUI](#interactive-drawing-gui)
-9. [Configuration Reference](#configuration-reference)
-10. [Results](#results)
-11. [What Can Be Improved](#what-can-be-improved)
+1. [Project Overview](#project-overview)
+2. [Architecture](#architecture)
+3. [Dataset](#dataset)
+4. [Training History](#training-history)
+5. [Results](#results)
+6. [Setup & Installation](#setup--installation)
+7. [How to Run](#how-to-run)
+8. [File Structure](#file-structure)
+9. [Technical Details](#technical-details)
+10. [Known Limitations & Future Work](#known-limitations--future-work)
 
 ---
 
-## How It Works
+## Project Overview
 
-### Architecture
+This project takes a photograph or scan of handwritten text and transcribes it to a string.
+It handles both individual word crops and full pages with multiple lines.
 
-The model is a **CRNN** — a CNN feature extractor feeding into a recurrent sequence model,
-trained end-to-end with CTC loss.
-
-```
-Input image (1, 32, 128)
-        │
-        ▼
-┌───────────────┐
-│  CNN Backbone │  4 blocks of Conv-BN-ReLU + MaxPool
-│               │  Collapses height to 1, preserves width
-│  Output:      │  (512, 1, 32)
-└───────┬───────┘
-        │  reshape to sequence
-        ▼
-┌───────────────┐
-│  BiLSTM x2   │  2 stacked bidirectional LSTM layers
-│  hidden=256   │  captures left and right context
-│  Output:      │  (32, 512)
-└───────┬───────┘
-        │
-        ▼
-┌───────────────┐
-│  Linear Head  │  projects to vocabulary size (96 classes)
-└───────┬───────┘
-        │
-        ▼
-  CTC Decode  →  "hello"
-```
-
-**CNN Backbone** — Four convolutional blocks progressively reduce the 32px-tall input
-image down to a single-row feature map of width W/4. This turns the 2D image into a
-1D sequence of 32 column vectors, each summarising a vertical slice of the word.
-
-**BiLSTM** — Two stacked bidirectional LSTM layers read the column sequence left-to-right
-and right-to-left simultaneously, giving each time step full context of the whole word.
-
-**CTC Loss** — Connectionist Temporal Classification allows the model to be trained without
-knowing which output character aligns to which pixel. It marginalises over all valid
-alignments, making it ideal for handwriting where character widths vary.
-
-### Decoding
-
-Two decoding strategies are available after training:
-
-- **Greedy** — picks the highest-probability character at each time step, then collapses
-  repeated tokens and removes blanks. Fast but suboptimal.
-- **Beam Search** — maintains the top-N candidate sequences at each step and picks the
-  best final sequence. More accurate, especially for ambiguous strokes.
-
-### Data Pipeline
-
-Images are loaded as grayscale, resized to a fixed height of 32px (width scaled
-proportionally then padded/cropped to 128px), and normalised to `[-1, 1]`.
-
-During training, light augmentations are applied:
-- Random rotation ±3°
-- Random width scaling ±10%
-- Random brightness jitter ±30
-- Gaussian noise (σ=5)
-
-Splits are generated deterministically from the data by grouping samples by **writer ID**,
-ensuring no writer appears in more than one split (writer-independent evaluation):
-- **Train** — 29,851 samples (~80% of writers)
-- **Val** — 888 samples (~10% of writers)
-- **Test** — 7,566 samples (~10% of writers)
+**Full-page recognition pipeline:**
+1. **Preprocess** — grayscale, denoise (Gaussian blur), adaptive binarization that handles grey/textured paper from phone photos
+2. **Line segmentation** — horizontal projection profile finds text rows
+3. **Word segmentation** — horizontal morphological dilation + vertical projection finds individual words within each line
+4. **Word recognition** — CRNN model run on each word crop
+5. **Reassembly** — words → lines → full text string
 
 ---
 
-## Project Structure
+## Architecture
+
+### CRNN (Convolutional Recurrent Neural Network)
 
 ```
-handwriting-recognition/
-├── config.py          # All hyperparameters, paths, and vocabulary
-├── model.py           # CRNN architecture (CNN + BiLSTM + CTC head)
-├── dataset.py         # IAM dataset loader, augmentations, split generation
-├── train.py           # Training loop with AMP, checkpointing, TensorBoard
-├── evaluate.py        # CER/WER metrics, beam search decoder, test-set eval
-├── inference.py       # Single-image prediction from file
-├── draw.py            # Interactive GUI — draw a word and predict it
-├── requirements.txt   # Python dependencies
-└── data/
-    └── raw/
-        └── archive/
-            └── iam_words/
-                ├── words.txt       # Ground-truth labels
-                └── words/          # Word image tree (a01/a01-000u/...)
+Input: (B, 1, 32, 128)  — grayscale word image, height=32, width=128
+
+CNN Backbone
+  Block 1: Conv(1→64)   × 2  + MaxPool(2,2)   → (B,  64, 16, W/2)
+  Block 2: Conv(64→128) × 2  + MaxPool(2,2)   → (B, 128,  8, W/4)
+  Block 3: Conv(128→256)× 3  + MaxPool(2,1)   → (B, 256,  4, W/4)
+  Block 4: Conv(256→512)× 3  + MaxPool(4,1)   → (B, 512,  1, W/4)
+                                               ↑ height fully collapsed to 1
+
+Map-to-Sequence: squeeze + permute → (T, B, 512)   T = W/4 = 32 time steps
+
+BiLSTM Stack
+  2 stacked bidirectional LSTM layers
+  Hidden units: 256 per direction (512 combined)
+  Dropout: 0.3 between layers
+
+Linear Head: 512 → 96 classes (95 printable ASCII + CTC blank)
+
+Output: (T, B, 96)  — log-softmax scores, fed to CTC loss
 ```
 
-Directories created automatically at runtime:
-```
-checkpoints/    # Saved model weights (.pt files)
-runs/           # TensorBoard logs
-```
+**Parameter count:** ~7.2M trainable parameters
 
----
+**Conv-BN-ReLU blocks** with Kaiming weight init for CNN and Xavier for the linear head.
 
-## Setup
-
-**Requirements:** Python 3.10+, an NVIDIA GPU (recommended)
-
-### 1. Install dependencies
-
-```bash
-pip install -r requirements.txt
-```
-
-### 2. Install PyTorch with CUDA support
-
-The default `pip install torch` installs the CPU-only build. For GPU support:
-
-```bash
-# CUDA 12.1 (works with driver versions reporting CUDA 12.x or 13.x)
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-
-# CUDA 11.8
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-```
-
-Verify GPU is detected:
-```bash
-python -c "import torch; print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0))"
-```
+**CTC Decoding strategies:**
+- **Greedy** — argmax per time step, collapse repeated tokens, remove blanks. Fast.
+- **Beam search** — prefix beam search, configurable width (default 5–10). More accurate on ambiguous strokes. Pure Python, no external language model.
 
 ---
 
 ## Dataset
 
-Download the **IAM Handwriting Word Database** from Kaggle:
-[nibinv23/iam-handwriting-word-database](https://www.kaggle.com/datasets/nibinv23/iam-handwriting-word-database)
+### IAM Handwriting Database (Local, Kaggle)
+- ~38,000 word-level images from scanned handwriting by 657 different writers
+- Writer-independent splits: no writer appears in more than one split
+  - Train: ~80% of writers (~29,800 samples)
+  - Val: ~10% of writers (~3,700 samples)
+  - Test: ~10% of writers (~7,500 samples)
+- Source: `nibinv23/iam-handwriting-word-database` on Kaggle
 
-Extract `archive.zip` into `data/raw/`:
-```bash
-# Windows PowerShell
-Expand-Archive -Path archive.zip -DestinationPath data\raw\
+### HuggingFace IAM Dataset (Runs 3 & 4)
+- `priyank-m/IAM_words_text_recognition` — ~69,000 word samples
+- Larger and cleaner than the Kaggle version
+- Loaded via `dataset_hf.py`, auto-cached by HuggingFace
 
-# Linux / macOS
-unzip archive.zip -d data/raw/
+### Synthetic Data (Run 4)
+- 50,000 word images generated from 13 Windows handwriting fonts:
+  `Inkfree`, `Comic Sans MS`, `Bradley Hand ITC`, `Segoe Print`, `Segoe Script`,
+  `Lucida Handwriting`, `Mistral`, `Brush Script MT`, `Kristen ITC`, `MV Boli`,
+  `Freestyle Script`, `French Script MT`, `Gigi`
+- Generated with random backgrounds, stroke widths, and augmentations
+- Script: `generate_synthetic.py` — outputs to `data/synthetic/`
+- Combined with HF IAM via `dataset_combined.py` (ConcatDataset)
+
+### Vocabulary
+95 printable ASCII characters + CTC blank token (index 0):
 ```
-
-The expected layout after extraction:
+ !"#&'()*+,-./0123456789:;?ABCDEFGHIJKLMNOPQRSTUVWXYZ
+abcdefghijklmnopqrstuvwxyz
 ```
-data/raw/archive/iam_words/
-├── words.txt
-└── words/
-    ├── a01/
-    ├── a02/
-    └── ...
-```
-
-No further setup is needed — train/val/test splits are generated automatically.
+Total: **96 classes**
 
 ---
 
-## Training
+## Training History
 
-```bash
-python train.py
-```
+All runs used: **Adam optimizer, OneCycleLR scheduler, AMP (fp16), gradient clipping (max norm 5.0), weight decay 1e-4**
 
-**Optional flags:**
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--epochs N` | 50 | Number of training epochs |
-| `--batch-size N` | 64 | Batch size (reduce if GPU runs out of memory) |
-| `--resume PATH` | None | Resume training from a saved checkpoint |
-
-**Examples:**
-```bash
-python train.py --epochs 100 --batch-size 32
-python train.py --resume checkpoints/epoch_050.pt
-```
-
-**What gets saved:**
-- `checkpoints/best.pt` — saved whenever validation CER improves
-- `checkpoints/epoch_NNN.pt` — saved every 5 epochs
-
-**Monitor training in a separate terminal:**
-```bash
-tensorboard --logdir runs
-```
-Then open `http://localhost:6006`. Logged metrics: `train/loss`, `val/loss`, `val/CER`, `train/lr`.
-
-**Training features:**
-- Automatic Mixed Precision (fp16) for ~2x speed on CUDA
-- OneCycleLR learning rate schedule
-- Gradient clipping (max norm 5.0)
-- AdamW optimiser with weight decay
+Hardware: **NVIDIA GeForce RTX 3050 Laptop GPU (4GB VRAM), CUDA 11.8**
 
 ---
 
-## Evaluation
-
-Run the full test set (7,566 samples) and print CER, WER, and sample predictions:
-
-```bash
-python evaluate.py
-```
-
-**Optional flags:**
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--checkpoint PATH` | `checkpoints/best.pt` | Checkpoint to load |
-| `--split` | `test` | Dataset split: `train`, `val`, or `test` |
-| `--beam` | off | Use beam search instead of greedy decoding |
-| `--beam-width N` | 5 | Number of beams for beam search |
-| `--batch-size N` | 64 | Batch size |
-
-**Examples:**
-```bash
-python evaluate.py --beam --beam-width 10
-python evaluate.py --split val --checkpoint checkpoints/epoch_030.pt
-```
-
-**Output:**
-```
-[greedy]  CER=0.1640  WER=0.3200  (7,566 samples)
-
-Sample predictions:
-  GT  : 'hello'
-  PRED: 'hello'
-
-  GT  : 'world'
-  PRED: 'worId'
-```
-
-**Metrics:**
-- **CER** (Character Error Rate) — edit distance between predicted and ground-truth string,
-  divided by ground-truth length. 0.16 = ~16% of characters are wrong.
-- **WER** (Word Error Rate) — same but at the word level. Always higher than CER.
+### Run 1 — Baseline
+- **Dataset:** Local IAM Kaggle (~38k samples)
+- **Epochs:** 50, Batch size: 64, LR: 3e-4
+- **Augmentation:** rotation ±5°, scale ±15%, horizontal shear ±0.15, brightness ±40, Gaussian noise σ=8
+- **Result:** CER ~16.6% — model learned the task but struggled heavily with real handwriting due to domain gap
 
 ---
 
-## Inference
-
-Predict the text in a single word image:
-
-```bash
-python inference.py --image path/to/word.png
-```
-
-**Optional flags:**
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--checkpoint PATH` | `checkpoints/best.pt` | Checkpoint to load |
-| `--beam` | off | Use beam search |
-| `--beam-width N` | 5 | Beam width |
-| `--show` | off | Display image + prediction in a matplotlib window |
-
-**Examples:**
-```bash
-python inference.py --image word.png --beam --beam-width 10
-python inference.py --image word.png --show
-```
-
-**Output:**
-```
-[greedy]  "recognition"
-```
+### Run 2 — Stronger Augmentation
+- **Dataset:** Local IAM Kaggle (~38k samples)
+- **Epochs:** 50
+- **Changes from Run 1:**
+  - Added **elastic distortion** (α=12, σ=4) applied 50% of the time
+  - Added **random erosion/dilation** (30% probability) — simulates pen width variation
+  - Increased `RNN_DROPOUT` from 0.1 → 0.3
+- **Result:** CER ~12% — less overfitting, meaningfully better on unseen writers
 
 ---
 
-## Interactive Drawing GUI
-
-Draw a word with your mouse and have the model transcribe it in real time:
-
-```bash
-python draw.py
-```
-
-A window appears with a white 640×160 canvas. Draw a single word, then click **Predict**.
-Click **Clear** to reset and try again.
-
-```
-┌──────────────────────────────────────────┐
-│  Draw a single handwritten word below    │
-├──────────────────────────────────────────┤
-│                                          │
-│   [white canvas — draw here]             │
-│                                          │
-├──────────────────────────────────────────┤
-│   [ Predict ]   [ Clear ]                │
-│                                          │
-│   [greedy]  "hello"                      │
-└──────────────────────────────────────────┘
-```
-
-**Optional flags:**
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--checkpoint PATH` | `checkpoints/best.pt` | Checkpoint to load |
-| `--beam` | off | Use beam search |
-| `--beam-width N` | 5 | Beam width |
-
-Note: the model was trained on scanned handwriting samples, so mouse-drawn input will look
-different to the training data. Results are best when drawing slowly and clearly.
+### Run 3 — Larger Dataset (HuggingFace)
+- **Dataset:** HuggingFace `priyank-m/IAM_words_text_recognition` (~69k samples)
+- **Epochs:** 50
+- All augmentations from Run 2 carried over
+- **Result:** CER ~9% — more diverse training data made a significant difference
 
 ---
 
-## Configuration Reference
-
-All settings live in `config.py`. Key values:
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `DEVICE` | `"cuda"` | `"cpu"` if no GPU available |
-| `IMG_HEIGHT` | `32` | Fixed image height (px) |
-| `IMG_WIDTH` | `128` | Fixed image width after padding (px) |
-| `EPOCHS` | `50` | Training epochs |
-| `BATCH_SIZE` | `64` | Training batch size |
-| `LR` | `3e-4` | Peak learning rate |
-| `RNN_HIDDEN` | `256` | BiLSTM hidden units per direction |
-| `RNN_LAYERS` | `2` | Number of stacked BiLSTM layers |
-| `RNN_DROPOUT` | `0.1` | Dropout between LSTM layers |
-| `BEAM_WIDTH` | `5` | Default beam search width |
-| `USE_AMP` | `True` | Mixed precision (fp16) — CUDA only |
-| `GRAD_CLIP` | `5.0` | Gradient clipping max norm |
+### Run 4 — Overnight Training (Best Model)
+- **Dataset:** HuggingFace IAM (69k) + Synthetic (50k) via `dataset_combined.py` — ~119k total samples
+- **Epochs:** 50
+- All augmentations active
+- Training time: ~5 hours overnight on RTX 3050 Laptop
+- **Result:** Test CER **7.51%**, Test WER **22.3%** — best checkpoint saved as `checkpoints/best.pt`
+- Checkpoint backups: `best_checkpoint_rayans_model.pt`, `best_checkpoint_v2_page_recogniser.pt`
 
 ---
 
 ## Results
 
-Trained for 50 epochs on an NVIDIA RTX 3070 Ti (~32s/epoch):
+| Run | Dataset | Augmentation | CER (test) | WER (test) |
+|-----|---------|-------------|-----------|-----------|
+| 1 | IAM local ~38k | Basic | ~16.6% | ~45% |
+| 2 | IAM local ~38k | + Elastic + Erosion | ~12% | ~35% |
+| 3 | HuggingFace IAM 69k | Full | ~9% | ~28% |
+| **4** | **HF IAM + Synthetic 119k** | **Full** | **7.51%** | **22.3%** |
 
-| Metric | Value |
-|--------|-------|
-| Best val CER | ~0.164 |
-| Training time | ~27 min total |
+**CER** = Character Error Rate: edit distance / reference length (lower is better)  
+**WER** = Word Error Rate: word-level edit distance (always higher than CER)
 
-Overfitting was observed from around epoch 35 — training loss continued to fall while
-validation CER plateaued. The best checkpoint is saved automatically.
+**Sample predictions from the best model (Run 4):**
+```
+GT  : 'the'       PRED: 'the'       ✓
+GT  : 'writing'   PRED: 'writng'    ✗ (one char dropped)
+GT  : 'quickly'   PRED: 'quickly'   ✓
+GT  : 'beautiful' PRED: 'beautifl'  ✗ (minor)
+```
+
+**Full page test** — "How are you guys? Would you like chocolates? If so why or why not?"
+```
+Predicted: "to are you quys / Would you like hocolates' / IF so why or ehiy no"
+```
+The model reads each line and word correctly in structure but makes substitution errors
+from the domain gap between clean scanned training data and phone photos.
 
 ---
 
-## What Can Be Improved
+## Setup & Installation
 
-### Accuracy
+### Requirements
+- **Python 3.12** (PyTorch has no wheels for Python 3.13+)
+- NVIDIA GPU with CUDA recommended (CPU works but is very slow for training)
+- Windows/Linux/macOS
 
-**Increase regularisation**
-The model overfits after ~35 epochs. Raising `RNN_DROPOUT` from `0.1` to `0.3` in
-`config.py` and adding dropout after CNN blocks would reduce this.
+### 1. Clone the repo and switch to this branch
+```bash
+git clone https://github.com/Luke-Smyth45/Handwriting-Recognition-AI.git
+cd Handwriting-Recognition-AI
+git checkout Rayans-Model
+```
 
-**Stronger augmentations**
-The current augmentations are minimal. Adding elastic distortion, random perspective
-warps, and random erosion/dilation would better simulate real handwriting variation.
-The `albumentations` library (already in `requirements.txt`) supports all of these.
+### 2. Install PyTorch with CUDA (do this FIRST before requirements.txt)
+```bash
+# CUDA 11.8 (tested — RTX 3050 Laptop)
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
 
-**Larger input width**
-`IMG_WIDTH = 128` crops longer words. Increasing to `256` or `512` would preserve more
-information at the cost of more memory and slower training.
+# CUDA 12.1 (for newer GPUs)
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+```
 
-**Attention mechanism**
-Replacing the BiLSTM with a Transformer encoder would give the model global attention
-over the full sequence rather than only local context, typically improving accuracy on
-longer words.
+Verify GPU is detected:
+```bash
+python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+```
 
-**Language model decoding**
-The beam search has no language model — it scores sequences purely on acoustic probability.
-Integrating a character-level n-gram LM via `pyctcdecode` or `ctcdecode` would significantly
-reduce WER by favouring real words over nonsense sequences.
+### 3. Install remaining dependencies
+```bash
+pip install -r requirements.txt
+```
 
-### Data
+### 4. Download the dataset
 
-**Pre-training on synthetic data**
-IAM contains ~38k word samples, which is small by modern standards. Generating millions of
-synthetic handwriting images using fonts and augmentations (e.g. with the `TextRecognitionDataGenerator`
-library) and pre-training on those before fine-tuning on IAM is the single highest-leverage
-improvement available.
+**Option A — HuggingFace (recommended, 69k samples, auto-downloads):**
+```bash
+python -c "from datasets import load_dataset; ds = load_dataset('priyank-m/IAM_words_text_recognition'); print('Done')"
+```
 
-**Additional real datasets**
-Other handwriting datasets that can supplement IAM: RIMES (French), CVL, ICDAR competitions.
+**Option B — Local IAM from Kaggle (~38k samples):**
+1. Download from: `https://www.kaggle.com/datasets/nibinv23/iam-handwriting-word-database`
+2. Extract so that this path exists:
+   ```
+   data/raw/archive/iam_words/words.txt
+   data/raw/archive/iam_words/words/a01/...
+   ```
+
+**Option C — Generate synthetic data (Windows only, requires handwriting fonts):**
+```bash
+python generate_synthetic.py
+# Outputs 50,000 images to data/synthetic/
+```
+
+### 5. Place the trained checkpoint
+Copy the provided checkpoint file to:
+```
+checkpoints/best.pt
+```
+
+---
+
+## How to Run
+
+### Interactive Drawing GUI
+
+```bash
+# Default (greedy decoding)
+python draw.py
+
+# With beam search (more accurate, slightly slower)
+python draw.py --beam --beam-width 10
+```
+
+The GUI has four buttons:
+| Button | What it does |
+|--------|-------------|
+| **Predict** | Runs the model on whatever is drawn/loaded on the canvas |
+| **Load Word** | Opens a file picker to load a single word image (jpg/png) |
+| **Load Page** | Opens a file picker to load a full page image; runs the complete page pipeline and shows a scrollable result popup with a Copy button |
+| **Clear** | Resets the canvas |
+
+**Tips for best results with drawn input:**
+- Draw slowly and clearly with consistent stroke thickness
+- Fill the canvas height — small strokes are harder to recognise
+- The model was trained on scanned handwriting, not mouse strokes, so results vary
+
+### Full Page Recognition (CLI)
+
+```bash
+# Basic
+python page_recogniser.py --image path/to/page.jpg
+
+# With beam search
+python page_recogniser.py --image path/to/page.jpg --beam --beam-width 10
+
+# Save a debug image showing line and word bounding boxes
+python page_recogniser.py --image path/to/page.jpg --show
+
+# Save individual word crops to debug_crops/ for inspection
+python page_recogniser.py --image path/to/page.jpg --save-crops
+
+# Verbose output (line/word counts + per-word predictions)
+python page_recogniser.py --image path/to/page.jpg --verbose
+```
 
 ### Training
 
-**Early stopping**
-Currently training runs for a fixed number of epochs. Adding early stopping (halt when
-val CER hasn't improved for N epochs) would prevent wasted compute and save the best model
-more reliably.
+```bash
+# Train on local IAM dataset
+python train.py
 
-**Learning rate tuning**
-The OneCycleLR scheduler works well but the peak LR (`3e-4`) and warmup fraction (`10%`)
-were not tuned. A learning rate finder pass before training would identify the optimal value.
+# Train on HuggingFace IAM dataset (recommended)
+python train.py --hf
 
-### Deployment
+# Train on combined HF + synthetic dataset (Run 4 config — best results)
+python train.py --combined
 
-**ONNX export**
-The trained model can be exported to ONNX for deployment outside of Python/PyTorch:
-```python
-torch.onnx.export(model, dummy_input, "model.onnx")
+# Resume from a checkpoint
+python train.py --resume checkpoints/best.pt
 ```
 
-**Batch inference API**
-`inference.py` processes one image at a time. Wrapping it in a FastAPI server would allow
-batch requests and integration into other applications.
+### Evaluation
 
-**Line-level recognition**
-The current model operates on pre-segmented word images. Adding a text detection stage
-(e.g. CRAFT or DBNet) would allow recognising full lines or paragraphs from a photograph.
+```bash
+# Evaluate on test set with greedy decoding
+python evaluate.py --checkpoint checkpoints/best.pt
+
+# Evaluate with beam search
+python evaluate.py --checkpoint checkpoints/best.pt --beam --beam-width 10
+
+# Evaluate on validation set
+python evaluate.py --checkpoint checkpoints/best.pt --split val
+```
+
+### Single Image Inference
+
+```bash
+python inference.py --image path/to/word.png
+python inference.py --image path/to/word.png --beam --beam-width 10
+```
+
+---
+
+## File Structure
+
+```
+AI Project/
+├── config.py              # All hyperparameters, paths, vocabulary (edit this first)
+├── model.py               # CRNN architecture (CNNBackbone + BiLSTM + CTC head)
+├── dataset.py             # IAM local dataset + WordAugmenter (elastic distortion etc.)
+├── dataset_hf.py          # HuggingFace IAM dataset loader
+├── dataset_combined.py    # ConcatDataset: HF IAM + synthetic
+├── generate_synthetic.py  # Synthetic word image generator (Windows fonts)
+├── train.py               # Training loop (AMP, OneCycleLR, TensorBoard, checkpointing)
+├── evaluate.py            # CER/WER metrics + beam search decoder + test-set eval script
+├── page_recogniser.py     # Full page recognition pipeline (preprocess→lines→words→text)
+├── draw.py                # Tkinter drawing/loading GUI
+├── inference.py           # Standalone single-image inference
+├── requirements.txt       # Python dependencies
+├── checkpoints/           # Saved model weights — NOT committed (too large for git)
+│   └── best.pt            # ← place your checkpoint here
+└── data/                  # Dataset files — NOT committed (too large for git)
+    ├── raw/archive/iam_words/
+    │   ├── words.txt
+    │   └── words/
+    └── synthetic/
+```
+
+---
+
+## Technical Details
+
+### Image Preprocessing
+- **Fixed size:** 32px height, up to 128px width (aspect ratio preserved → pad with white to 128px)
+- **Normalisation:** `(pixel / 255 - 0.5) / 0.5` → range [-1, 1]
+- **Real photo preprocessing** (phone photos): adaptive Gaussian threshold (blockSize=31, C=15) + mild dilation to strengthen thin strokes
+
+### Data Augmentation (training only, CPU-side via OpenCV)
+
+| Augmentation | Parameters | Notes |
+|---|---|---|
+| Random rotation | ±5° | Simulates tilted writing |
+| Random width scale | 0.85×–1.15× | Handles wide/narrow letter spacing |
+| Horizontal shear | ±0.15 | Simulates italic/slanted handwriting |
+| **Elastic distortion** | α=12, σ=4 (50% prob) | Most effective — random pixel-level warping |
+| Brightness jitter | ±40 pixel value | Handles varying ink density |
+| Gaussian noise | σ=8 | Paper grain / scanner noise |
+| Random erosion/dilation | 2×2 kernel (30% prob) | Simulates pen width variation |
+
+### Page Segmentation Algorithm
+
+**Line detection (horizontal projection):**
+1. Invert binary image so text pixels = 1
+2. Sum pixels per row → horizontal projection profile
+3. Smooth with moving average (kernel size scales with image height: `max(5, height // 80)`)
+4. Threshold at 4% of peak → text rows vs. blank rows
+5. Extract contiguous text regions with 6px padding
+
+**Word detection within each line (morphological approach):**
+1. Horizontally dilate with a wide kernel (`width = line_height // 5`) to merge spaced letters within a word into solid blobs
+2. Column projection on dilated image to find word boundaries
+3. Apply 4px padding to each word bounding box
+
+> **Why dilate first?** Without it, natural letter spacing causes individual letters to be
+> detected as separate "words". Dilation merges them before projection, so gaps between words
+> are detected rather than gaps between letters.
+
+### Page Preprocessing for Phone Photos
+- Resize to minimum 1200px height, cap at 3000px width
+- Gaussian blur 5×5 for denoising
+- Adaptive threshold: `blockSize = max(51, (height // 15) | 1)`, C=20 — blockSize scales with image so it works on both small and large photos
+- Morphological opening (3×3 ellipse kernel) removes paper texture noise
+- Auto-invert if text came out white on black
+
+### Hyperparameters (Run 4 — best model)
+
+```python
+IMG_HEIGHT   = 32      # fixed image height
+IMG_WIDTH    = 128     # fixed image width (padded)
+RNN_HIDDEN   = 256     # BiLSTM hidden units per direction (512 total)
+RNN_LAYERS   = 2       # stacked BiLSTM layers
+RNN_DROPOUT  = 0.3     # dropout between LSTM layers
+BATCH_SIZE   = 64
+EPOCHS       = 50
+LR           = 3e-4    # OneCycleLR peak learning rate
+WEIGHT_DECAY = 1e-4
+GRAD_CLIP    = 5.0     # gradient clipping max norm
+BEAM_WIDTH   = 5       # default beam search width
+USE_AMP      = True    # fp16 mixed precision
+```
+
+---
+
+## Known Limitations & Future Work
+
+### Domain Gap (Main Issue)
+The model was trained on **clean scanned IAM images**. When given a **phone photo** of
+handwriting, performance drops noticeably due to differences in lighting, background texture,
+perspective, and ink colour. The `clean_real_image()` function in `draw.py` partially bridges
+this with adaptive thresholding, but fully fixing it requires:
+- Fine-tuning on phone photos of real handwriting
+- Adding augmentations that simulate phone photo degradation (motion blur, perspective warp, non-uniform lighting)
+
+### Accuracy Improvements
+- **Language model decoding:** beam search currently has no language model. Integrating a
+  character n-gram LM via `pyctcdecode` would significantly lower WER by preferring real words
+- **Wider input:** `IMG_WIDTH=128` crops long words. Increasing to 256 would preserve more of
+  each word at the cost of memory
+- **More synthetic data:** 50k was helpful; scaling to 500k+ with more font diversity would
+  likely push CER below 5%
+- **Transformer encoder:** replacing BiLSTM with a Transformer (e.g. ViT-based) would give
+  global attention across the full word sequence
+
+### Segmentation Improvements
+- **Slanted lines:** horizontal projection fails on pages where lines aren't axis-aligned
+- **Touching characters:** adaptive dilation kernel width could be tuned per-image
+- **Punctuation:** short word crops (apostrophes, single letters) are currently filtered out
+  as noise — a smarter filter would keep them
