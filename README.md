@@ -11,15 +11,16 @@ Built with PyTorch using a CRNN (Convolutional Recurrent Neural Network) trained
 ## Table of Contents
 
 1. [Project Overview](#project-overview)
-2. [Architecture](#architecture)
-3. [Dataset](#dataset)
-4. [Training History](#training-history)
-5. [Results](#results)
-6. [Setup & Installation](#setup--installation)
-7. [How to Run](#how-to-run)
-8. [File Structure](#file-structure)
-9. [Technical Details](#technical-details)
-10. [Known Limitations & Future Work](#known-limitations--future-work)
+2. [Background & Design Decisions](#background--design-decisions)
+3. [Architecture](#architecture)
+4. [Dataset](#dataset)
+5. [Training History](#training-history)
+6. [Results](#results)
+7. [Setup & Installation](#setup--installation)
+8. [How to Run](#how-to-run)
+9. [File Structure](#file-structure)
+10. [Technical Details](#technical-details)
+11. [Known Limitations & Future Work](#known-limitations--future-work)
 
 ---
 
@@ -34,6 +35,29 @@ It handles both individual word crops and full pages with multiple lines.
 3. **Word segmentation** — horizontal morphological dilation + vertical projection finds individual words within each line
 4. **Word recognition** — CRNN model run on each word crop
 5. **Reassembly** — words → lines → full text string
+
+---
+
+## Background & Design Decisions
+
+### The IAM Handwriting Database
+The IAM Handwriting Database is a standard benchmark dataset for handwriting recognition research, originally collected at the University of Bern, Switzerland. It contains handwritten English text from 657 different writers, with images scanned at 300 DPI on white paper. The word-level subset (used here) contains approximately 115,000 labelled word images across all splits. It is the most widely used dataset for this task and allows direct comparison of results against published academic work.
+
+### Why CRNN?
+CRNN (Convolutional Recurrent Neural Network) was chosen because handwriting recognition is fundamentally a sequence problem — a word image is a sequence of visual strokes that maps to a sequence of characters. A pure CNN would treat the image as a fixed spatial pattern and cannot naturally produce a variable-length output sequence. A pure RNN has no efficient way to extract spatial features from an image. CRNN combines both:
+- The **CNN** extracts visual features from the image (stroke shapes, curves, pen direction)
+- The **RNN (BiLSTM)** reads those features as a left-to-right sequence, capturing how characters flow and connect
+
+This architecture was first proposed by Shi et al. (2015) in "An End-to-End Trainable Neural Network for Image-based Sequence Recognition" and remains the standard approach for word-level handwriting recognition.
+
+### Why CTC Loss?
+CTC (Connectionist Temporal Classification) is used instead of standard cross-entropy because handwriting does not come with character-level alignment. When training, we only know what the word says ("hello") — we do not know which pixel columns correspond to which letters. Cross-entropy would require this alignment. CTC solves this by summing over all possible ways the output sequence could be aligned to the label, so the model learns to recognise characters without needing per-character position labels. It also naturally handles characters of different widths (e.g. 'i' is much narrower than 'w') and spaces between characters.
+
+### Why Bidirectional LSTM?
+A standard (unidirectional) LSTM reads the sequence left to right, so when predicting a character it only knows what came before it. A **bidirectional** LSTM runs two passes — one left-to-right and one right-to-left — and combines both. This is important in handwriting because the shape of a letter is often ambiguous without context from the letters around it. For example, a poorly written 'a' might look like a 'u' in isolation, but the surrounding letters make the correct reading clear.
+
+### Why OneCycleLR?
+OneCycleLR is a learning rate schedule that starts low, ramps up to a peak over the first ~10% of training, then gradually decreases to near zero using a cosine curve. Compared to a fixed learning rate, this consistently reaches lower loss values faster because the warm-up phase stabilises early training and the annealing phase allows fine-grained convergence at the end.
 
 ---
 
@@ -148,6 +172,7 @@ Hardware: **NVIDIA GeForce RTX 3050 Laptop GPU (4GB VRAM), CUDA 11.8**
 - All augmentations active
 - Training time: ~5 hours overnight on RTX 3050 Laptop
 - **Result:** Test CER **7.51%**, Test WER **22.3%** — best checkpoint saved as `checkpoints/best.pt`
+- The best checkpoint was selected based on lowest **validation CER** during training; the model was saved automatically whenever val CER improved
 - Checkpoint backups: `best_checkpoint_rayans_model.pt`, `best_checkpoint_v2_page_recogniser.pt`
 
 ---
@@ -161,8 +186,11 @@ Hardware: **NVIDIA GeForce RTX 3050 Laptop GPU (4GB VRAM), CUDA 11.8**
 | 3 | HuggingFace IAM 69k | Full | ~9% | ~28% |
 | **4** | **HF IAM + Synthetic 119k** | **Full** | **7.51%** | **22.3%** |
 
-**CER** = Character Error Rate: edit distance / reference length (lower is better)  
-**WER** = Word Error Rate: word-level edit distance (always higher than CER)
+### What CER and WER mean
+
+**CER (Character Error Rate)** measures what percentage of individual characters were wrong. It is calculated as the edit distance (number of insertions, deletions, and substitutions needed to turn the prediction into the correct answer) divided by the length of the correct answer. A CER of 7.51% means that on average, about 1 in 13 characters is incorrect. For context, commercial OCR systems on clean printed text achieve below 1%, while state-of-the-art handwriting recognition on IAM achieves around 3–5%. A CER of 7.51% is a reasonable result for a from-scratch implementation trained on limited hardware.
+
+**WER (Word Error Rate)** applies the same edit-distance logic but at the word level — a word counts as wrong if even a single character in it is incorrect. WER is always higher than CER. A WER of 22.3% means roughly 1 in 4 words contains at least one mistake. This is why full-sentence recognition still has noticeable errors even when individual characters are mostly correct.
 
 **Sample predictions from the best model (Run 4):**
 ```
@@ -172,12 +200,22 @@ GT  : 'quickly'   PRED: 'quickly'   ✓
 GT  : 'beautiful' PRED: 'beautifl'  ✗ (minor)
 ```
 
+### Context Against Published Results
+
+| System | CER on IAM |
+|--------|-----------|
+| This project (Run 4) | 7.51% |
+| Typical CRNN baseline (published) | 8–12% |
+| State-of-the-art (2023, Transformer-based) | ~3–4% |
+| Commercial OCR on printed text | <1% |
+
+A CER of 7.51% is competitive with published CRNN baselines on IAM, and was achieved on a consumer laptop GPU (RTX 3050, 4GB VRAM) in approximately 5 hours of training.
+
 **Full page test** — "How are you guys? Would you like chocolates? If so why or why not?"
 ```
 Predicted: "to are you quys / Would you like hocolates' / IF so why or ehiy no"
 ```
-The model reads each line and word correctly in structure but makes substitution errors
-from the domain gap between clean scanned training data and phone photos.
+The model correctly identifies the number of lines and the number of words per line, but makes character substitution errors. This is primarily caused by the domain gap — the model was trained on clean 300 DPI scans, but the test input was a phone photo with different lighting, perspective, and background texture.
 
 ---
 
