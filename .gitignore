@@ -26,6 +26,10 @@ __pycache__/
 # Java model (replaced by Python)
 models/
 
+# Checkpoints — too large for git (best.pt is ~125 MB, over GitHub's 100 MB limit)
+# Add best.pt manually to your submission zip after downloading from GitHub
+checkpoints/
+
 # Debug outputs
 debug_model_input.png
 
