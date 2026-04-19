@@ -99,16 +99,21 @@ Output: (T, B, 96)  — log-softmax scores, fed to CTC loss
 
 ## Dataset
 
-### IAM Handwriting Database (Local, Kaggle)
+### IAM Handwriting Database (Local, Kaggle) — Runs 1 & 2
 - ~38,000 word-level images from scanned handwriting by 657 different writers
-- Writer-independent splits: no writer appears in more than one split
-  - Train: ~80% of writers (~29,800 samples)
-  - Val: ~10% of writers (~3,700 samples)
-  - Test: ~10% of writers (~7,500 samples)
+- Split by **writer ID** (writer-independent): no writer appears in more than one split
+  - Train: ~29,800 samples (~80% of writers)
+  - Val: ~3,700 samples (~10% of writers)
+  - Test: ~7,500 samples (~10% of writers)
+- Approximate because the 80/10/10 ratio applies to the number of writers, and writers vary in how many samples they contributed
 - Source: `nibinv23/iam-handwriting-word-database` on Kaggle
 
 ### HuggingFace IAM Dataset (Runs 3 & 4)
-- `priyank-m/IAM_words_text_recognition` — ~69,000 word samples
+- `priyank-m/IAM_words_text_recognition` — 115,318 total word samples
+- Comes with pre-defined splits (60/20/20):
+  - Train: **69,190 samples**
+  - Val: **23,064 samples**
+  - Test: **23,064 samples**
 - Larger and cleaner than the Kaggle version
 - Loaded via `dataset_hf.py`, auto-cached by HuggingFace
 
@@ -167,24 +172,26 @@ Hardware: **NVIDIA GeForce RTX 3050 Laptop GPU (4GB VRAM), CUDA 11.8**
 ---
 
 ### Run 4 — Overnight Training (Best Model)
-- **Dataset:** HuggingFace IAM (69k) + Synthetic (50k) via `dataset_combined.py` — ~119k total samples
+- **Training data:** HuggingFace IAM train (69,190) + Synthetic (50,000) = **119,190 total training samples**
+- **Validation data:** HuggingFace IAM val (23,064 samples, real handwriting only — no synthetic)
+- **Test data:** HuggingFace IAM test (23,064 samples, real handwriting only — no synthetic)
 - **Epochs:** 50
 - All augmentations active
 - Training time: ~5 hours overnight on RTX 3050 Laptop
-- **Result:** Test CER **7.51%**, Test WER **22.3%** — best checkpoint saved as `checkpoints/best.pt`
-- The best checkpoint was selected based on lowest **validation CER** during training; the model was saved automatically whenever val CER improved
+- The best checkpoint was selected based on lowest **validation CER** across all 50 epochs; saved automatically whenever val CER improved
+- **Result:** Test CER **7.51%**, Test WER **22.3%** — evaluated on the 23,064 sample test set
 - Checkpoint backups: `best_checkpoint_rayans_model.pt`, `best_checkpoint_v2_page_recogniser.pt`
 
 ---
 
 ## Results
 
-| Run | Dataset | Augmentation | CER (test) | WER (test) |
-|-----|---------|-------------|-----------|-----------|
-| 1 | IAM local ~38k | Basic | ~16.6% | ~45% |
-| 2 | IAM local ~38k | + Elastic + Erosion | ~12% | ~35% |
-| 3 | HuggingFace IAM 69k | Full | ~9% | ~28% |
-| **4** | **HF IAM + Synthetic 119k** | **Full** | **7.51%** | **22.3%** |
+| Run | Train Samples | Test Samples | Augmentation | CER (test) | WER (test) |
+|-----|--------------|-------------|-------------|-----------|-----------|
+| 1 | ~29,800 (Kaggle IAM) | ~7,500 | Basic | ~16.6% | ~45% |
+| 2 | ~29,800 (Kaggle IAM) | ~7,500 | + Elastic + Erosion | ~12% | ~35% |
+| 3 | 69,190 (HF IAM) | 23,064 | Full | ~9% | ~28% |
+| **4** | **119,190 (HF IAM + Synthetic)** | **23,064** | **Full** | **7.51%** | **22.3%** |
 
 ### What CER and WER mean
 
