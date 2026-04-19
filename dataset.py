@@ -36,19 +36,21 @@ def parse_words_txt(words_txt: Path) -> List[dict]:
     with open(words_txt, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
+            # Skip comment lines and blank lines
             if not line or line.startswith("#"):
                 continue
             parts = line.split()
             if len(parts) < 9:
                 continue
             word_id, ok_flag = parts[0], parts[1]
-            transcription = parts[8]
+            transcription = parts[8]   # the actual handwritten word label
 
-            # Skip poorly segmented samples
+            # Skip samples that were badly segmented (blurry/incomplete crops)
             if ok_flag == "err":
                 continue
 
-            # Build image path: a01-000u-00-00  -> words/a01/a01-000u/a01-000u-00-00.png
+            # Build the image file path from the word ID
+            # e.g. a01-000u-00-00 → words/a01/a01-000u/a01-000u-00-00.png
             segs = word_id.split("-")
             img_path = (
                 config.WORDS_IMG
@@ -57,7 +59,7 @@ def parse_words_txt(words_txt: Path) -> List[dict]:
                 / f"{word_id}.png"
             )
 
-            # Filter characters not in our alphabet
+            # Drop characters outside our 95-char alphabet
             label = "".join(c for c in transcription if c in config.CHAR2IDX)
             if not label:
                 continue
@@ -82,7 +84,8 @@ def make_splits(
     no writer appears in more than one split (writer-independent evaluation).
     Returns {'train': [...], 'val': [...], 'test': [...]}.
     """
-    # Group by writer (first segment of word id, e.g. "a01")
+    # Group samples by their writer ID (e.g. "a01" from "a01-000u-00-00")
+    # This ensures the model is tested on writers it has never seen during training
     from collections import defaultdict
     writers: dict = defaultdict(list)
     for r in records:
@@ -118,18 +121,22 @@ def make_splits(
 # ---------------------------------------------------------------------------
 
 class WordAugmenter:
-    """Strong augmentation pipeline for handwriting word images (grayscale)."""
+    """
+    Strong augmentation pipeline applied to training images only.
+    Makes the model more robust by simulating different handwriting styles,
+    pen widths, lighting conditions, and paper textures.
+    """
 
     def __call__(self, img: np.ndarray) -> np.ndarray:
-        img = self._random_rotate(img)
-        img = self._random_scale(img)
-        img = self._random_shear(img)
+        img = self._random_rotate(img)           # simulate tilted writing
+        img = self._random_scale(img)            # simulate wide/narrow letter spacing
+        img = self._random_shear(img)            # simulate italic/slanted writing
         if np.random.random() < 0.5:
-            img = self._elastic_distortion(img)
-        img = self._random_brightness(img)
-        img = self._gaussian_noise(img)
+            img = self._elastic_distortion(img)  # random pixel-level warping (50% of the time)
+        img = self._random_brightness(img)       # simulate different ink densities
+        img = self._gaussian_noise(img)          # simulate scanner grain / paper texture
         if np.random.random() < 0.3:
-            img = self._random_erosion_dilation(img)
+            img = self._random_erosion_dilation(img)  # simulate thin vs thick pen strokes
         return img
 
     @staticmethod
@@ -216,23 +223,24 @@ def preprocess_image(
 ) -> np.ndarray:
     """
     Resize to target_h (keep aspect ratio), pad/crop width to target_w.
-    Returns float32 array in [0, 1] with shape (1, H, W).
+    Returns float32 array in [-1, 1] with shape (1, H, W).
     """
     h, w = img.shape
+    # Scale height to exactly target_h, keeping aspect ratio
     scale = target_h / h
     new_w = max(1, int(w * scale))
     img = cv2.resize(img, (new_w, target_h), interpolation=cv2.INTER_AREA)
 
-    # Pad or crop width
+    # Pad short images with white (255), or crop overlong images
     if new_w < target_w:
         pad = target_w - new_w
         img = np.pad(img, ((0, 0), (0, pad)), mode="constant", constant_values=255)
     else:
         img = img[:, :target_w]
 
-    img = img.astype(np.float32) / 255.0          # [0, 1]
-    img = (img - 0.5) / 0.5                        # [-1, 1]  (normalise)
-    return img[np.newaxis, :, :]                   # (1, H, W)
+    img = img.astype(np.float32) / 255.0          # scale to [0, 1]
+    img = (img - 0.5) / 0.5                        # normalise to [-1, 1]
+    return img[np.newaxis, :, :]                   # add channel dim → (1, H, W)
 
 
 # ---------------------------------------------------------------------------

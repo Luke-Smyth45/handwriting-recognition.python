@@ -34,13 +34,14 @@ from page_recogniser import recognise_page, load_model, visualise_segmentation
 def simulate_scanned(gray: np.ndarray) -> np.ndarray:
     """
     Make mouse-drawn strokes look more like scanned handwriting.
-    Keep it minimal — over-processing hurts more than it helps.
+    The model was trained on scanned IAM images, so raw mouse strokes
+    look too thin and sharp — this bridges that gap slightly.
     """
-    # Thicken strokes to match pen-on-paper thickness
+    # Thicken strokes to better match pen-on-paper width in training data
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     gray = cv2.dilate(gray, kernel, iterations=1)
 
-    # Very slight blur to soften the perfectly sharp digital edges
+    # Slight blur softens the perfectly sharp digital edges
     gray = cv2.GaussianBlur(gray, (3, 3), sigmaX=0.5)
 
     return gray
@@ -49,16 +50,17 @@ def simulate_scanned(gray: np.ndarray) -> np.ndarray:
 def clean_real_image(gray: np.ndarray) -> np.ndarray:
     """
     Clean up a real photo of handwriting so it looks like a clean scan.
-    Handles uneven lighting, shadows, and colour variation.
+    Used when the user loads an actual photo rather than drawing on the canvas.
     """
-    # Adaptive thresholding handles uneven lighting/shadows from phone photos
+    # Adaptive threshold handles uneven lighting and shadows from phone photos
+    # blockSize=31 is large enough to handle gradual lighting gradients
     gray = cv2.adaptiveThreshold(
         gray, 255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY,
         blockSize=31, C=15
     )
-    # Mild dilation to strengthen thin strokes
+    # Mild dilation strengthens thin strokes that the threshold may have weakened
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
     gray = cv2.dilate(gray, kernel, iterations=1)
     return gray
@@ -67,19 +69,20 @@ def clean_real_image(gray: np.ndarray) -> np.ndarray:
 def predict_from_array(gray: np.ndarray, model, device, use_beam, beam_width,
                        is_real_image: bool = False) -> str:
     """Run model on a grayscale numpy array."""
-    # Invert if background is dark
+    # The model expects white background with dark text — flip if inverted
     if gray.mean() < 128:
         gray = 255 - gray
 
+    # Apply different preprocessing depending on the image source
     if is_real_image:
-        gray = clean_real_image(gray)
+        gray = clean_real_image(gray)   # phone photo: adaptive threshold
     else:
-        gray = simulate_scanned(gray)
+        gray = simulate_scanned(gray)   # drawn input: thicken + blur
 
-    # Save debug image so we can see exactly what the model receives
-    debug_preprocessed = preprocess_image(gray)  # (1, H, W) in [-1, 1]
+    # Resize to 32×128 and normalise to [-1, 1] — the format the model expects
+    debug_preprocessed = preprocess_image(gray)  # (1, H, W)
     debug_vis = ((debug_preprocessed[0] + 1) * 127.5).astype(np.uint8)
-    cv2.imwrite("debug_model_input.png", debug_vis)
+    cv2.imwrite("debug_model_input.png", debug_vis)   # saved for debugging
 
     arr = debug_preprocessed
     tensor = torch.from_numpy(arr).unsqueeze(0).to(device)   # (1, 1, H, W)
@@ -88,7 +91,7 @@ def predict_from_array(gray: np.ndarray, model, device, use_beam, beam_width,
     with torch.no_grad():
         log_probs = model(tensor)   # (T, 1, C)
 
-    lp = log_probs[:, 0, :]        # (T, C)
+    lp = log_probs[:, 0, :]        # (T, C) — single sample
 
     if use_beam:
         return beam_decode(lp, beam_width=beam_width)

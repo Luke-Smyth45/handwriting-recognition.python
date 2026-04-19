@@ -69,49 +69,51 @@ def compute_wer(preds: List[str], gts: List[str]) -> float:
 def beam_decode(log_probs: torch.Tensor, beam_width: int = config.BEAM_WIDTH) -> str:
     """
     Pure-Python prefix beam search on a single sample.
+    More accurate than greedy because it keeps multiple candidate sequences alive
+    and picks the best one at the end instead of always taking the top-1 character.
 
     Args:
         log_probs : (T, num_classes)  log-softmax scores for one sample
-        beam_width: number of beams to keep
+        beam_width: number of candidate sequences to keep at each time step
     Returns:
         Decoded string.
     """
     T, C = log_probs.shape
     probs = log_probs.exp().cpu().numpy()
 
-    # beam: dict  prefix -> (prob_blank, prob_non_blank)
-    NEG_INF = float("-inf")
-    beams = {(): (1.0, 0.0)}  # empty prefix: (p_blank=1, p_nb=0)
+    # Each beam entry: prefix tuple → (probability ending in blank, probability ending in non-blank)
+    beams = {(): (1.0, 0.0)}  # start with empty prefix, full probability on blank
 
     for t in range(T):
-        p_t = probs[t]   # (C,)
+        p_t = probs[t]   # probability distribution over all characters at this time step
         new_beams = {}
 
         for prefix, (p_b, p_nb) in beams.items():
             p_total = p_b + p_nb
 
-            # Extend with blank
+            # Option 1: emit a blank — extends the same prefix
             new_p_b = p_total * p_t[config.BLANK_IDX]
             _merge(new_beams, prefix, new_p_b, 0.0)
 
-            # Extend with each non-blank character
+            # Option 2: emit each possible character
             for c in range(1, C):
                 p_c = p_t[c]
                 if len(prefix) > 0 and prefix[-1] == c:
-                    # Same char: only blank path can extend without doubling
+                    # Repeating the last character: only the blank-ending path can do this
+                    # without it being collapsed (CTC rule)
                     new_p_nb = p_b * p_c
                 else:
                     new_p_nb = p_total * p_c
                 _merge(new_beams, prefix + (c,), 0.0, new_p_nb)
 
-        # Prune to top beam_width beams
+        # Keep only the top beam_width candidates to limit computation
         beams = dict(
             sorted(new_beams.items(),
                    key=lambda x: x[1][0] + x[1][1],
                    reverse=True)[:beam_width]
         )
 
-    # Best beam
+    # Return the highest-scoring prefix
     best_prefix = max(beams, key=lambda p: beams[p][0] + beams[p][1])
     return "".join(config.IDX2CHAR.get(i, "") for i in best_prefix)
 

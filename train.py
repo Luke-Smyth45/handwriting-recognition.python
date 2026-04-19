@@ -59,29 +59,35 @@ def train_one_epoch(
 
     pbar = tqdm(loader, desc=f"Epoch {epoch:03d} [train]", leave=False, dynamic_ncols=True)
     for step, (images, targets, target_lens) in enumerate(pbar):
+        # Move data to GPU
         images      = images.to(device, non_blocking=True)
         targets     = targets.to(device, non_blocking=True)
         target_lens = target_lens.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
 
+        # Forward pass in fp16 (AMP) for speed and memory savings
         with autocast(enabled=config.USE_AMP):
             log_probs = model(images)                  # (T, B, C)
             T, B, _   = log_probs.shape
+            # CTC needs to know the sequence length for each sample (all equal here)
             input_lens = torch.full((B,), T, dtype=torch.long, device=device)
-
             loss = criterion(log_probs, targets, input_lens, target_lens)
 
+        # Backward pass — scaler handles fp16 gradient scaling
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
+        # Clip gradients to prevent large update spikes
         nn.utils.clip_grad_norm_(model.parameters(), config.GRAD_CLIP)
         scaler.step(optimizer)
         scaler.update()
+        # OneCycleLR steps every batch (not every epoch)
         scheduler.step()
 
         total_loss += loss.item()
         pbar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{scheduler.get_last_lr()[0]:.2e}")
 
+        # Log per-step metrics to TensorBoard
         global_step = epoch * len(loader) + step
         writer.add_scalar("train/loss_step", loss.item(), global_step)
         writer.add_scalar("train/lr", scheduler.get_last_lr()[0], global_step)
@@ -115,12 +121,13 @@ def validate(model, loader, criterion, device, writer, epoch):
 
         total_loss += loss.item()
 
-        # Greedy decode for CER
+        # Greedy decode each sample in the batch to measure CER
         preds_idx = log_probs.argmax(dim=2).permute(1, 0)  # (B, T)
         offset = 0
         for i in range(B):
             pred_str = _greedy_decode(preds_idx[i].cpu().tolist())
             tgt_len  = target_lens[i].item()
+            # Targets are packed flat — use offset to slice each sample's label
             gt_str   = "".join(
                 config.IDX2CHAR.get(targets[offset + j].item(), "")
                 for j in range(tgt_len)
@@ -184,28 +191,30 @@ def main():
     model = CRNN(num_classes=config.NUM_CLASSES).to(device)
     print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-    # Loss
+    # CTC loss — handles variable-length labels without needing alignment
+    # zero_infinity=True silences rare NaN losses from degenerate short sequences
     criterion = nn.CTCLoss(blank=config.BLANK_IDX, reduction="mean", zero_infinity=True)
 
-    # Optimiser
+    # AdamW adds weight decay directly to parameters (not through gradients)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=config.LR, weight_decay=config.WEIGHT_DECAY
     )
 
-    # Scheduler: OneCycleLR for fast convergence
+    # OneCycleLR: warms up LR for 10% of training then cosine-anneals to near zero
+    # This gives faster convergence than a fixed LR
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=config.LR,
         steps_per_epoch=len(train_loader),
         epochs=args.epochs,
-        pct_start=0.1,
+        pct_start=0.1,       # 10% warmup
         anneal_strategy="cos",
     )
 
-    # AMP scaler
+    # GradScaler manages the fp16 loss scaling to prevent underflow
     scaler = GradScaler(enabled=config.USE_AMP)
 
-    # Logging
+    # TensorBoard writer — run `tensorboard --logdir runs` to view live training curves
     writer = SummaryWriter(log_dir=str(config.LOG_DIR))
 
     # Resume

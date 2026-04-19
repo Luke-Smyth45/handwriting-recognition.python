@@ -39,28 +39,30 @@ def preprocess_page(img: np.ndarray) -> np.ndarray:
     Convert a page photo to a clean binary image ready for segmentation.
     Handles phone photos with uneven lighting, shadows, and grey backgrounds.
     """
-    # Convert to grayscale if needed
+    # Convert colour photo to grayscale
     if len(img.shape) == 3:
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     else:
         gray = img.copy()
 
-    # Resize so height is at least 1200px for good segmentation
+    # Upscale small images — segmentation works poorly below ~1200px height
     h, w = gray.shape
     if h < 1200:
         scale = 1200 / h
         gray = cv2.resize(gray, (int(w * scale), 1200), interpolation=cv2.INTER_CUBIC)
     h, w = gray.shape
+    # Cap width to avoid very wide images that slow everything down
     if w > 3000:
         scale = 3000 / w
         gray = cv2.resize(gray, (3000, int(h * scale)), interpolation=cv2.INTER_AREA)
 
-    # Denoise
+    # Smooth out noise before thresholding
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
 
-    # Adaptive thresholding with larger block size for grey/textured backgrounds
+    # Adaptive threshold: the block size scales with image height so it works on
+    # both small crops and large full-page photos
     h, w = gray.shape
-    block = max(51, (h // 15) | 1)
+    block = max(51, (h // 15) | 1)   # must be odd — the | 1 ensures that
     binary = cv2.adaptiveThreshold(
         gray, 255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
@@ -68,11 +70,12 @@ def preprocess_page(img: np.ndarray) -> np.ndarray:
         blockSize=block, C=20
     )
 
-    # Ensure dark text on white background
+    # Adaptive threshold can produce either black-on-white or white-on-black —
+    # flip if needed so text is always dark on a white background
     if np.mean(binary) < 128:
         binary = cv2.bitwise_not(binary)
 
-    # Remove small noise specks (paper texture)
+    # Morphological opening removes small noise dots (paper grain, scanner specks)
     kernel_noise = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel_noise)
 
@@ -89,18 +92,19 @@ def segment_lines(binary: np.ndarray, min_line_height: int = 10,
     Use horizontal projection profile to find text lines.
     Returns list of (y1, y2) row spans for each line.
     """
-    # Invert so text pixels = 1
-    inverted = cv2.bitwise_not(binary) // 255   # 0 or 1
+    # Invert so ink pixels = 1, background = 0
+    inverted = cv2.bitwise_not(binary) // 255
 
-    # Sum pixels per row
+    # Sum ink pixels across each row — rows with text have high sums
     row_sums = inverted.sum(axis=1)
 
-    # Smooth more aggressively to merge descenders/ascenders into their line
+    # Smooth the profile to merge ascenders/descenders back into their line
+    # Kernel size scales with image height for consistent behaviour
     smooth_size = max(5, binary.shape[0] // 80)
     kernel = np.ones(smooth_size) / smooth_size
     row_sums_smooth = np.convolve(row_sums.astype(float), kernel, mode='same')
 
-    # Find rows with text (above threshold)
+    # Any row above 4% of the peak count is considered a text row
     threshold = max(1, row_sums_smooth.max() * 0.04)
     in_line = row_sums_smooth > threshold
 
@@ -143,16 +147,17 @@ def segment_words(line_img: np.ndarray, min_word_width: int = 10,
     """
     inverted = cv2.bitwise_not(line_img)
 
-    # Dilate horizontally to merge letters within a word into one blob.
-    # The kernel width controls how much gap to bridge — scales with line height.
+    # Horizontally dilate to bridge gaps between letters within the same word.
+    # Without this, natural letter spacing causes each letter to look like its own "word".
+    # Kernel width scales with line height — taller lines have wider letter gaps.
     line_h = line_img.shape[0]
-    dilation_w = max(6, line_h // 5)  # smaller = less merging across word gaps
+    dilation_w = max(6, line_h // 5)
     kernel_dilate = cv2.getStructuringElement(
         cv2.MORPH_RECT, (dilation_w, 1)
     )
     dilated = cv2.dilate(inverted, kernel_dilate, iterations=1)
 
-    # Now use projection on the dilated image to find word boundaries
+    # Column projection on the dilated image — now gaps only appear between words, not letters
     col_sums = (dilated // 255).sum(axis=0).astype(float)
 
     threshold = max(1, col_sums.max() * 0.05)
@@ -241,7 +246,6 @@ def recognise_page(img: np.ndarray, model, device,
             continue
 
         line_words = []
-        junk_chars = set('.,!?;:\'"()[]{}#@$%^&*-_=+/\\|<>~`')
         for word_idx, (x1, x2) in enumerate(words):
             word_crop = line_img[:, x1:x2]
 

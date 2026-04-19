@@ -28,13 +28,15 @@ import config
 # ---------------------------------------------------------------------------
 
 class ConvBnRelu(nn.Module):
+    """Single Conv → BatchNorm → ReLU building block used throughout the CNN."""
     def __init__(self, in_ch: int, out_ch: int, kernel: int = 3,
                  stride: int = 1, padding: int = 1):
         super().__init__()
+        # bias=False because BatchNorm already handles the bias term
         self.block = nn.Sequential(
             nn.Conv2d(in_ch, out_ch, kernel, stride=stride,
                       padding=padding, bias=False),
-            nn.BatchNorm2d(out_ch),
+            nn.BatchNorm2d(out_ch),   # normalises activations for stable training
             nn.ReLU(inplace=True),
         )
 
@@ -61,27 +63,30 @@ class CNNBackbone(nn.Module):
     def __init__(self):
         super().__init__()
 
+        # Each block doubles the number of channels and shrinks the height
         self.block1 = nn.Sequential(
             ConvBnRelu(1,   64),
             ConvBnRelu(64,  64),
-            nn.MaxPool2d(kernel_size=2, stride=2),      # 32->16, W->W/2
+            nn.MaxPool2d(kernel_size=2, stride=2),      # height 32→16, width halved
         )
         self.block2 = nn.Sequential(
             ConvBnRelu(64,  128),
             ConvBnRelu(128, 128),
-            nn.MaxPool2d(kernel_size=2, stride=2),      # 16->8, W/2->W/4
+            nn.MaxPool2d(kernel_size=2, stride=2),      # height 16→8, width halved again
         )
         self.block3 = nn.Sequential(
             ConvBnRelu(128, 256),
             ConvBnRelu(256, 256),
             ConvBnRelu(256, 256),
-            nn.MaxPool2d(kernel_size=(2, 1), stride=(2, 1)),  # 8->4, W/4 unchanged
+            # Pool only vertically — keep full width so we don't lose horizontal detail
+            nn.MaxPool2d(kernel_size=(2, 1), stride=(2, 1)),  # height 8→4, width unchanged
         )
         self.block4 = nn.Sequential(
             ConvBnRelu(256, 512),
             ConvBnRelu(512, 512),
             ConvBnRelu(512, 512),
-            nn.MaxPool2d(kernel_size=(4, 1), stride=(4, 1)),  # 4->1
+            # Final vertical collapse — height becomes 1, turning the image into a sequence
+            nn.MaxPool2d(kernel_size=(4, 1), stride=(4, 1)),  # height 4→1
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -151,21 +156,22 @@ class CRNN(nn.Module):
         Returns:
             log_probs : (T, B, num_classes)  — log-softmax, ready for CTCLoss
         """
-        # CNN
+        # Step 1: CNN extracts visual features, collapses height to 1
         feat = self.cnn(x)                  # (B, 512, 1, T)
 
-        # Reshape to sequence
+        # Step 2: Reshape the 2D feature map into a 1D sequence of column vectors
         B, C, H, T = feat.shape
         assert H == 1, f"Height after CNN should be 1, got {H}"
-        feat = feat.squeeze(2)              # (B, 512, T)
-        feat = feat.permute(2, 0, 1)        # (T, B, 512)
+        feat = feat.squeeze(2)              # remove the H=1 dimension → (B, 512, T)
+        feat = feat.permute(2, 0, 1)        # reorder for LSTM: (T, B, 512)
 
-        # BiLSTM
+        # Step 3: BiLSTM reads the sequence and adds temporal context
         feat, _ = self.rnn(feat)            # (T, B, rnn_hidden*2)
 
-        # Linear projection
+        # Step 4: Project each time step to a probability over the vocabulary
         logits = self.head(feat)            # (T, B, num_classes)
 
+        # log_softmax gives log-probabilities — required by CTCLoss
         return F.log_softmax(logits, dim=2)
 
     # ------------------------------------------------------------------
@@ -183,7 +189,10 @@ class CRNN(nn.Module):
 # ---------------------------------------------------------------------------
 
 def _greedy_decode(indices: list) -> str:
-    """Collapse repeated tokens and remove blanks."""
+    """
+    CTC greedy decoding: remove blank tokens and collapse consecutive repeated characters.
+    e.g. [h, h, blank, e, l, l, blank, l, o] → "hello"
+    """
     prev, chars = config.BLANK_IDX, []
     for idx in indices:
         if idx != config.BLANK_IDX and idx != prev:
