@@ -145,28 +145,31 @@ Hardware: **NVIDIA GeForce RTX 3050 Laptop GPU (4GB VRAM), CUDA 11.8**
 ---
 
 ### Run 1 — Baseline
-- **Dataset:** Local IAM Kaggle (~38k samples)
+- **Dataset:** Local IAM Kaggle — Train: ~29,800 / Val: ~3,700 / Test: ~7,500 (80/10/10 writer-independent split)
 - **Epochs:** 50, Batch size: 64, LR: 3e-4
 - **Augmentation:** rotation ±5°, scale ±15%, horizontal shear ±0.15, brightness ±40, Gaussian noise σ=8
+- **Training time:** ~27 minutes (RTX 3050 Laptop)
 - **Result:** CER ~16.6% — model learned the task but struggled heavily with real handwriting due to domain gap
 
 ---
 
 ### Run 2 — Stronger Augmentation
-- **Dataset:** Local IAM Kaggle (~38k samples)
-- **Epochs:** 50
+- **Dataset:** Local IAM Kaggle — Train: ~29,800 / Val: ~3,700 / Test: ~7,500 (same split as Run 1)
+- **Epochs:** 50, Batch size: 64, LR: 3e-4
 - **Changes from Run 1:**
   - Added **elastic distortion** (α=12, σ=4) applied 50% of the time
   - Added **random erosion/dilation** (30% probability) — simulates pen width variation
   - Increased `RNN_DROPOUT` from 0.1 → 0.3
+- **Training time:** ~27 minutes (RTX 3050 Laptop)
 - **Result:** CER ~12% — less overfitting, meaningfully better on unseen writers
 
 ---
 
 ### Run 3 — Larger Dataset (HuggingFace)
-- **Dataset:** HuggingFace `priyank-m/IAM_words_text_recognition` (~69k samples)
-- **Epochs:** 50
+- **Dataset:** HuggingFace IAM — Train: 69,190 / Val: 23,064 / Test: 23,064 (pre-defined 60/20/20 split)
+- **Epochs:** 50, Batch size: 64, LR: 3e-4
 - All augmentations from Run 2 carried over
+- **Training time:** ~1.5 hours (RTX 3050 Laptop)
 - **Result:** CER ~9% — more diverse training data made a significant difference
 
 ---
@@ -175,7 +178,7 @@ Hardware: **NVIDIA GeForce RTX 3050 Laptop GPU (4GB VRAM), CUDA 11.8**
 - **Training data:** HuggingFace IAM train (69,190) + Synthetic (50,000) = **119,190 total training samples**
 - **Validation data:** HuggingFace IAM val (23,064 samples, real handwriting only — no synthetic)
 - **Test data:** HuggingFace IAM test (23,064 samples, real handwriting only — no synthetic)
-- **Epochs:** 50
+- **Epochs:** 50, Batch size: 64, LR: 3e-4
 - All augmentations active
 - Training time: ~5 hours overnight on RTX 3050 Laptop
 - The best checkpoint was selected based on lowest **validation CER** across all 50 epochs; saved automatically whenever val CER improved
